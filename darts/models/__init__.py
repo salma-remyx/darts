@@ -33,6 +33,9 @@ if TYPE_CHECKING:
     )
     from darts.models.forecasting.catboost_model import CatBoostModel as CatBoostModel
     from darts.models.forecasting.chronos2_model import Chronos2Model as Chronos2Model
+    from darts.models.forecasting.conformal_bellman_model import (
+        ConformalBellmanModel as ConformalBellmanModel,
+    )
     from darts.models.forecasting.conformal_models import (
         ConformalNaiveModel as ConformalNaiveModel,
     )
@@ -136,6 +139,10 @@ _LAZY_IMPORTS: dict[str, tuple[str, str | None]] = {
     "NaiveMovingAverage": ("darts.models.forecasting.baselines", None),
     "NaiveSeasonal": ("darts.models.forecasting.baselines", None),
     "NaiveEnsembleModel": ("darts.models.forecasting.naive_ensemble_model", None),
+    "ConformalBellmanModel": (
+        "darts.models.forecasting.conformal_bellman_model",
+        None,
+    ),
     "ConformalNaiveModel": ("darts.models.forecasting.conformal_models", None),
     "ConformalQRModel": ("darts.models.forecasting.conformal_models", None),
     "EnsembleModel": ("darts.models.forecasting.ensemble_model", None),

@@ -11,6 +11,7 @@ from darts import TimeSeries, concatenate
 from darts.datasets import AirPassengersDataset
 from darts.metrics import ae, err, ic, incs_qr, mic
 from darts.models import (
+    ConformalBellmanModel,
     ConformalNaiveModel,
     ConformalQRModel,
     LinearRegressionModel,
@@ -1727,4 +1728,155 @@ class TestConformalModel:
         )
         _ = cp_model.historical_forecasts(
             forecast_horizon=n, series=val_series, overlap_end=True
+        )
+
+
+class TestConformalBellmanModel:
+    """
+    Tests for the Bellman conformal model: horizon-coupled calibration that allocates the
+    miscoverage budget non-uniformly over the forecast horizon to minimize average interval
+    length at the same average coverage.
+    """
+
+    np.random.seed(42)
+
+    horizon = OUT_LEN + 1
+    ts_length = 13 + horizon
+    ts_passengers = AirPassengersDataset().load()[:ts_length]
+    ts_pass_train, ts_pass_val = (
+        ts_passengers[:-horizon],
+        ts_passengers[-horizon:],
+    )
+
+    def test_model_construction(self):
+        global_model = LinearRegressionModel(**regr_kwargs)
+
+        # un-trained global model
+        with pytest.raises(ValueError) as exc:
+            ConformalBellmanModel(model=global_model, quantiles=q)
+        assert (
+            str(exc.value) == "`model` must be a pre-trained `GlobalForecastingModel`."
+        )
+
+        # pre-trained global model works
+        global_model.fit(self.ts_pass_train)
+        model = ConformalBellmanModel(model=global_model, quantiles=q)
+        assert model.likelihood.type is LikelihoodType.Quantile
+
+        # non-centered quantiles
+        with pytest.raises(ValueError) as exc:
+            ConformalBellmanModel(model=global_model, quantiles=[0.2, 0.5, 0.6])
+        assert str(exc.value) == (
+            "quantiles lower than `q=0.5` need to share same difference to `0.5` as quantiles higher than `q=0.5`."
+        )
+
+    def test_calibrate_interval_budget_allocation(self):
+        """With identical score distributions that only differ in scale, the budget allocation
+        must give the cheap (small-scale) step at least as much coverage as the expensive step,
+        meet the average coverage target, and not be wider on average than the naive model."""
+        model = train_model(self.ts_pass_train, model_type="regression")
+        cp_bellman = ConformalBellmanModel(model=model, quantiles=q)
+        cp_naive = ConformalNaiveModel(model=model, quantiles=q)
+
+        # two horizon steps with identical score shapes; step 2 is 10x as expensive
+        rng = np.random.RandomState(42)
+        scores_cheap = np.sort(rng.exponential(scale=1.0, size=300))
+        scores = np.stack([scores_cheap, 10.0 * scores_cheap])
+        residuals = scores.reshape(2, 1, 300)
+
+        target_cov = 0.8  # from quantiles [0.1, 0.5, 0.9]
+        q_hat_bellman = cp_bellman._calibrate_interval(residuals)[1][:, 0, 0]
+        q_hat_naive = cp_naive._calibrate_interval(residuals)[1][:, 0, 0]
+
+        # empirical per-step coverage on the calibration scores
+        cov_steps = (scores <= q_hat_bellman[:, None]).mean(axis=1)
+        # average coverage meets the target
+        assert cov_steps.mean() >= target_cov - 1e-9
+        # the cheap step gets relatively tighter intervals than the expensive step
+        assert cov_steps[0] >= cov_steps[1]
+        # not wider on average than the naive per-step calibration on the same scores
+        assert q_hat_bellman.mean() <= q_hat_naive.mean() + 1e-8
+
+    def test_calibrate_interval_short_average_length(self):
+        """On heteroscedastic scores, the average interval length must improve over the naive
+        per-step calibration at the same average coverage."""
+        model = train_model(self.ts_pass_train, model_type="regression")
+        cp_bellman = ConformalBellmanModel(model=model, quantiles=q)
+        cp_naive = ConformalNaiveModel(model=model, quantiles=q)
+
+        rng = np.random.RandomState(0)
+        horizon, n_cal = 6, 500
+        scales = np.array([0.1, 0.5, 1.0, 2.0, 5.0, 10.0])
+        scores = np.stack([
+            np.sort(rng.gamma(shape=2.0, scale=s, size=n_cal)) for s in scales
+        ])
+        residuals = scores.reshape(horizon, 1, n_cal)
+
+        q_hat_bellman = cp_bellman._calibrate_interval(residuals)[1][:, 0, 0]
+        q_hat_naive = cp_naive._calibrate_interval(residuals)[1][:, 0, 0]
+
+        cov_bellman = (scores <= q_hat_bellman[:, None]).mean()
+        assert cov_bellman >= 0.8 - 1e-9
+        assert q_hat_bellman.mean() < q_hat_naive.mean()
+
+    def test_predict(self):
+        """Calibrated predictions through the public API: correct quantile columns, and average
+        interval width not larger than the naive conformal model on the same calibration set."""
+        model_instance = LinearRegressionModel(
+            lags=IN_LEN, output_chunk_length=OUT_LEN
+        ).fit(self.ts_pass_train)
+        model_bellman = ConformalBellmanModel(model_instance, quantiles=q)
+        model_naive = ConformalNaiveModel(model_instance, quantiles=q)
+
+        pred_bellman = model_bellman.predict(
+            n=self.horizon, series=self.ts_pass_train, **pred_lklp
+        )
+        pred_naive = model_naive.predict(
+            n=self.horizon, series=self.ts_pass_train, **pred_lklp
+        )
+
+        cols_expected = likelihood_component_names(
+            self.ts_pass_train.columns, quantile_names(q)
+        )
+        assert pred_bellman.columns.tolist() == cols_expected
+        assert len(pred_bellman) == self.horizon
+        assert pred_bellman.start_time() == (
+            self.ts_pass_train.end_time() + self.ts_pass_train.freq
+        )
+
+        # center forecasts must equal the forecasting model's forecast
+        fc_columns = likelihood_component_names(
+            self.ts_pass_train.columns, quantile_names([0.5])
+        )
+        pred_fc = model_instance.predict(n=self.horizon, series=self.ts_pass_train)
+        np.testing.assert_array_almost_equal(
+            pred_bellman[fc_columns].all_values(), pred_fc.all_values()
+        )
+
+        # average width of the 80% interval must not exceed the naive model's
+        width_bellman = (
+            pred_bellman[cols_expected[2]].values()
+            - pred_bellman[cols_expected[0]].values()
+        ).mean()
+        width_naive = (
+            pred_naive[cols_expected[2]].values()
+            - pred_naive[cols_expected[0]].values()
+        ).mean()
+        assert width_bellman <= width_naive + 1e-8
+
+    def test_historical_forecasts(self):
+        """Calibrated historical forecasts work through the shared conformal machinery."""
+        model_instance = LinearRegressionModel(
+            lags=IN_LEN, output_chunk_length=OUT_LEN
+        ).fit(self.ts_pass_train)
+        model = ConformalBellmanModel(model_instance, quantiles=q)
+        hfcs = model.historical_forecasts(
+            series=self.ts_pass_train,
+            forecast_horizon=self.horizon,
+            last_points_only=True,
+            **pred_lklp,
+        )
+        assert isinstance(hfcs, TimeSeries)
+        assert hfcs.columns.tolist() == likelihood_component_names(
+            self.ts_pass_train.columns, quantile_names(q)
         )
