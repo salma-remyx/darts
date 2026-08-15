@@ -39,6 +39,9 @@ if TYPE_CHECKING:
     from darts.models.forecasting.conformal_models import (
         ConformalQRModel as ConformalQRModel,
     )
+    from darts.models.forecasting.conformal_dp_model import (
+        ConformalDPModel as ConformalDPModel,
+    )
     from darts.models.forecasting.dlinear import DLinearModel as DLinearModel
     from darts.models.forecasting.ensemble_model import EnsembleModel as EnsembleModel
     from darts.models.forecasting.exponential_smoothing import (
@@ -138,6 +141,7 @@ _LAZY_IMPORTS: dict[str, tuple[str, str | None]] = {
     "NaiveEnsembleModel": ("darts.models.forecasting.naive_ensemble_model", None),
     "ConformalNaiveModel": ("darts.models.forecasting.conformal_models", None),
     "ConformalQRModel": ("darts.models.forecasting.conformal_models", None),
+    "ConformalDPModel": ("darts.models.forecasting.conformal_dp_model", None),
     "EnsembleModel": ("darts.models.forecasting.ensemble_model", None),
     "ExponentialSmoothing": ("darts.models.forecasting.exponential_smoothing", None),
     "FFT": ("darts.models.forecasting.fft", None),
