@@ -65,6 +65,7 @@ Ensemble Models (`GlobalForecastingModel <https://unit8co.github.io/darts/usergu
 Conformal Models  (`GlobalForecastingModel <https://unit8co.github.io/darts/userguide/covariates.html#global-forecasting-models-gfms>`__)
     - :class:`~darts.models.forecasting.conformal_models.ConformalNaiveModel`
     - :class:`~darts.models.forecasting.conformal_models.ConformalQRModel`
+    - :class:`~darts.models.forecasting.bellman_conformal.ConformalBellmanModel`
 
 Classification Models
 ---------------------
