@@ -20,9 +20,11 @@ from darts.utils.statistics import (
     remove_from_series,
     remove_seasonality,
     remove_trend,
+    rolling_correlations,
     stationarity_test_adf,
     stationarity_test_kpss,
     stationarity_tests,
+    temporal_correlation_volatility,
 )
 from darts.utils.timeseries_generation import (
     constant_timeseries,
@@ -319,7 +321,6 @@ class TestPlotToleranceCurve:
 class TestStatisticsInputValidation:
     ts = constant_timeseries(value=2, length=100)
     ts_other = constant_timeseries(value=1, length=100)
-
     def test_check_seasonality_invalid_m(self):
         with pytest.raises(ValueError, match="m must be an integer greater than 1"):
             check_seasonality(self.ts, m=1.5)
@@ -417,3 +418,89 @@ class TestStatisticsInputValidation:
             ValueError, match="alpha must be greater than 0 and less than 1"
         ):
             plot_fn(*args, max_lag=10, alpha=1)
+
+
+class TestCorrelationVolatility:
+    n_steps = 400
+    # component 2 flips from a perfect copy of component 1 to its mirror image
+    z = np.random.default_rng(42).normal(size=n_steps)
+    sign = np.where(np.arange(n_steps) < n_steps // 2, 1.0, -1.0)
+    ts_dynamic = TimeSeries.from_values(np.stack([z, z * sign], axis=1))
+    # both components stay noisy copies of the same driver
+    ts_static = TimeSeries.from_values(
+        np.stack([z, z + 0.1 * np.random.default_rng(43).normal(size=n_steps)], axis=1)
+    )
+
+    def test_tcv_detects_changing_correlations(self):
+        # a re-wiring structure must score clearly above a stable one
+        assert (
+            temporal_correlation_volatility(self.ts_dynamic, window=50)
+            > 10 * temporal_correlation_volatility(self.ts_static, window=50)
+        )
+
+    def test_tcv_static_structure_is_close_to_zero(self):
+        assert temporal_correlation_volatility(self.ts_static, window=50) < 0.01
+
+    def test_tcv_is_bounded(self):
+        tcv = temporal_correlation_volatility(self.ts_dynamic, window=50)
+        assert 0.0 < tcv <= 2.0
+
+    def test_rolling_correlations_recover_the_flip(self):
+        correlations = rolling_correlations(self.ts_dynamic, window=50)
+        assert correlations.width == 4  # flattened 2x2 matrix
+        assert len(correlations) == self.n_steps - 50 + 1
+        # entry "0~1" is the off-diagonal: starts at +1, ends at -1
+        off_diagonal = correlations.values(copy=False)[:, 1]
+        assert off_diagonal[0] == pytest.approx(1.0, abs=1e-6)
+        assert off_diagonal[-1] == pytest.approx(-1.0, abs=1e-6)
+
+    def test_rolling_correlations_keeps_time_index(self):
+        ts = self.ts_static.with_times_and_values(
+            times=pd.date_range("2020-01-01", periods=self.n_steps, freq="D"),
+            values=self.ts_static.values(copy=False),
+        )
+        correlations = rolling_correlations(ts, window=50)
+        assert isinstance(correlations.time_index, pd.DatetimeIndex)
+        assert correlations.time_index[0] == pd.Timestamp("2020-02-19")
+        assert correlations.time_index[-1] == ts.time_index[-1]
+
+    def test_tcv_stride_and_min_periods(self):
+        # a stride larger than the flip boundary still sees the re-wiring
+        with_stride = temporal_correlation_volatility(
+            self.ts_dynamic, window=50, stride=10
+        )
+        assert with_stride > 0
+        # windows containing NaNs are dropped unless min_periods is lowered
+        values = self.ts_static.values(copy=True)
+        values[:3, 1] = np.nan
+        ts_with_nans = TimeSeries.from_values(values)
+        assert temporal_correlation_volatility(ts_with_nans, window=50) > 0.0
+        with_min_periods = temporal_correlation_volatility(
+            ts_with_nans, window=50, min_periods=10
+        )
+        assert with_min_periods > 0.0
+
+
+class TestCorrelationVolatilityInputValidation:
+    ts_multi = TimeSeries.from_values(np.random.default_rng(0).normal(size=(20, 2)))
+    ts_univariate = TimeSeries.from_values(np.arange(20).astype(float))
+
+    def test_invalid_window(self):
+        with pytest.raises(ValueError, match="window must be between 2"):
+            temporal_correlation_volatility(self.ts_multi, window=1)
+        with pytest.raises(ValueError, match="window must be between 2"):
+            temporal_correlation_volatility(self.ts_multi, window=21)
+
+    def test_invalid_stride(self):
+        with pytest.raises(ValueError, match="stride must be at least 1"):
+            temporal_correlation_volatility(self.ts_multi, window=10, stride=0)
+
+    def test_univariate_series(self):
+        with pytest.raises(ValueError, match="only defined for multivariate series"):
+            temporal_correlation_volatility(self.ts_univariate, window=10)
+        with pytest.raises(ValueError, match="only defined for multivariate series"):
+            rolling_correlations(self.ts_univariate, window=10)
+
+    def test_too_few_windows(self):
+        with pytest.raises(ValueError, match="fewer than two windows"):
+            temporal_correlation_volatility(self.ts_multi, window=20)

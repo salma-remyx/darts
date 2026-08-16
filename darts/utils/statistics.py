@@ -27,6 +27,10 @@ from darts.logging import get_logger, raise_log
 from darts.metrics.metrics import _tolerance_coverages
 from darts.metrics.utils import _get_tolerance_levels
 from darts.typing import TimeSeriesLike
+from darts.utils.correlation_volatility import (
+    rolling_correlations,
+    temporal_correlation_volatility,
+)
 from darts.utils.likelihood_models.sklearn import QuantileRegression
 from darts.utils.missing_values import fill_missing_values
 from darts.utils.ts_utils import get_single_series
@@ -36,6 +40,26 @@ _NP_2_OR_ABOVE = int(np.__version__.split(".")[0]) >= 2
 _NP_TRAPEZOID_FN = np.trapezoid if _NP_2_OR_ABOVE else np.trapz
 
 logger = get_logger(__name__)
+
+__all__ = [
+    "check_seasonality",
+    "extract_trend_and_seasonality",
+    "granger_causality_tests",
+    "plot_acf",
+    "plot_ccf",
+    "plot_hist",
+    "plot_pacf",
+    "plot_residuals_analysis",
+    "plot_tolerance_curve",
+    "remove_from_series",
+    "remove_seasonality",
+    "remove_trend",
+    "rolling_correlations",
+    "stationarity_test_adf",
+    "stationarity_test_kpss",
+    "stationarity_tests",
+    "temporal_correlation_volatility",
+]
 
 
 def check_seasonality(

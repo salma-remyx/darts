@@ -208,6 +208,11 @@ series.plot()
 
 * **Backtesting:** Utilities for simulating historical forecasts, using moving time windows.
 
+* **Correlation Volatility Diagnostics:** `darts.utils.statistics` can quantify how much the pairwise
+  correlation structure of a multivariate series drifts over time (`temporal_correlation_volatility()`),
+  and expose the underlying rolling correlation matrices (`rolling_correlations()`), to identify series
+  whose inter-component relationships are unstable.
+
 * **PyTorch Lightning Support:** All deep learning models are implemented using PyTorch Lightning,
   supporting among other things custom callbacks, GPUs/TPUs training and custom trainers.
 
