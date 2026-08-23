@@ -38,6 +38,7 @@ from darts.utils.historical_forecasts.utils import (
     _adjust_historical_forecasts_time_index,
     _slice_intersect_series,
 )
+from darts.utils.label_shift import label_shift_weights, weighted_quantile
 from darts.utils.timeseries_generation import _build_forecast_series
 from darts.utils.ts_utils import (
     SeriesType,
@@ -69,6 +70,8 @@ class ConformalModel(GlobalForecastingModel, ABC):
         cal_length: int | None = None,
         cal_stride: int = 1,
         cal_num_samples: int = 500,
+        label_shift_bins: int | None = None,
+        label_shift_eval_length: int = 20,
         random_state: int | None = None,
     ):
         """Base Conformal Prediction Model.
@@ -129,6 +132,15 @@ class ConformalModel(GlobalForecastingModel, ABC):
             model). The non-conformity scores are computed on the quantile values of these forecasts (using quantiles
             `quantiles`). Uses `1` for deterministic models. The actual conformal forecasts can have a different number
             of samples given with parameter `num_samples` in downstream tasks (e.g. predict, historical forecasts, ...).
+        label_shift_bins
+            Optionally, the number of equal-width histogram bins used to estimate the target value distribution of
+            the calibration set and of the most recent past (the evaluation window). When set, the non-conformity
+            scores are weighted by the ratio of the two densities before computing the calibrated quantiles, which
+            keeps the intervals approximately valid when the target value distribution drifts over time (label
+            shift). `None` (default) disables the adaptation and uses the scores exchangeable / unweighted.
+        label_shift_eval_length
+            The number of most recent target values used as the evaluation window for the label shift adaptation.
+            Only used if `label_shift_bins` is set.
         random_state
             Controls the randomness for reproducible forecasting.
         """
@@ -146,6 +158,10 @@ class ConformalModel(GlobalForecastingModel, ABC):
             raise_log(ValueError("`cal_stride` must be `>=1`."))
         if cal_num_samples < 1:
             raise_log(ValueError("`cal_num_samples` must be `>=1`."))
+        if label_shift_bins is not None and label_shift_bins < 2:
+            raise_log(ValueError("`label_shift_bins` must be `>=2` or `None`."))
+        if label_shift_eval_length < 1:
+            raise_log(ValueError("`label_shift_eval_length` must be `>=1`."))
 
         super().__init__(add_encoders=None)
 
@@ -177,6 +193,8 @@ class ConformalModel(GlobalForecastingModel, ABC):
         self.cal_num_samples = (
             cal_num_samples if model.supports_probabilistic_prediction else 1
         )
+        self.label_shift_bins = label_shift_bins
+        self.label_shift_eval_length = label_shift_eval_length
         self._likelihood = Likelihood(
             likelihood_type=LikelihoodType.Quantile,
             parameter_names=quantile_names(quantiles),
@@ -1197,6 +1215,8 @@ class ConformalModel(GlobalForecastingModel, ABC):
 
             # get the last index respecting `cal_stride`
             last_res_idx = -math.ceil(ignore_n_residuals / cal_stride)
+            # number of forecasts the useful residuals cover (used to align the label array)
+            last_res_idx_abs = len(s_hfcs) + last_res_idx
             # get only useful residuals
             res = res[:last_res_idx]
 
@@ -1259,15 +1279,40 @@ class ConformalModel(GlobalForecastingModel, ABC):
             if last_points_only:
                 # -> (1, n components, n samples * n past residuals)
                 res = res.transpose(2, 1, 0)
+                # target value covered by each of the (single point) calibration forecasts,
+                # -> (n components, n past residuals)
+                labels = series_.values(copy=False)[[
+                    n_steps_between(
+                        end=time_, start=series_.start_time(), freq=series_.freq
+                    )
+                    for time_ in s_hfcs._time_index[: res.shape[2]]
+                ]].T
             else:
                 # rearrange the residuals to avoid look-ahead bias and to have the same number of examples per
                 # point in the horizon. We want the most recent residuals in the past for each step in the horizon.
                 res = np.array(res)
 
+                # target value covered by each calibration forecast and step in the horizon,
+                # indexed exactly like `res`; the most recent forecasts can reach beyond the
+                # end of `series`, in which case their labels are left as `nan`
+                values_ = series_.values(copy=False)
+                n_vals = len(values_)
+                labels = np.full((len(res), forecast_horizon, values_.shape[1]), np.nan)
+                for idx_fc, fc in enumerate(s_hfcs[: last_res_idx_abs]):
+                    idx_start = n_steps_between(
+                        end=fc.start_time(),
+                        start=series_.start_time(),
+                        freq=series_.freq,
+                    )
+                    idx_end = idx_start + forecast_horizon
+                    if idx_end <= n_vals:
+                        labels[idx_fc] = values_[idx_start:idx_end]
+
                 # go through each step in the horizon, use all useful information from the end (most recent values),
                 # and skip information at beginning (most distant past);
                 # -> (forecast horizon, n components, n past residuals)
                 res_ = []
+                labels_ = []
                 for idx_horizon in range(forecast_horizon):
                     n = idx_horizon + 1
                     # ignore residuals at beginning
@@ -1277,7 +1322,15 @@ class ConformalModel(GlobalForecastingModel, ABC):
                         math.ceil(forecast_horizon / cal_stride) - (idx_fc_start + 1)
                     )
                     res_.append(res[idx_fc_start : idx_fc_end or None, idx_horizon])
+                    # -> (n past residuals, n components)
+                    labels_.append(
+                        labels[idx_fc_start : idx_fc_end or None, idx_horizon]
+                    )
                 res = np.concatenate(res_, axis=2).T
+                # `res` -> (n components, forecast horizon, n past residuals). The residual
+                # columns come from the horizon steps in order, so keep one label per
+                # (component, residual column) by concatenating along the horizon axis
+                labels = np.concatenate(labels_, axis=1).T
 
             # get the last conformal forecast index (exclusive) based on the residual examples
             last_fc_idx = res.shape[2] + math.ceil(horizon_ocs / cal_stride)
@@ -1299,8 +1352,17 @@ class ConformalModel(GlobalForecastingModel, ABC):
                 # optionally, use only `cal_length` residuals
                 cal_start = cal_end - cal_length if cal_length is not None else None
 
+                # label shift adaptation: weight the residuals by the ratio of the target
+                # value density in the evaluation window over the calibration window.
+                # the evaluation window is the most recent slice of the (already
+                # look-ahead-free) calibration labels, directly preceding the forecast
+                weights = self._label_shift_weights(res, labels, cal_start, cal_end)
+
                 # calibrate and apply interval to the forecasts
-                q_hat_ = self._calibrate_interval(res[:, :, cal_start:cal_end])
+                q_hat_ = self._calibrate_interval(
+                    res[:, :, cal_start:cal_end],
+                    None if weights is None else weights[:, :, cal_start:cal_end],
+                )
                 vals = self._apply_interval(pred_vals_, q_hat_)
 
                 # optionally, generate samples from the intervals
@@ -1473,7 +1535,7 @@ class ConformalModel(GlobalForecastingModel, ABC):
 
     @abstractmethod
     def _calibrate_interval(
-        self, residuals: np.ndarray
+        self, residuals: np.ndarray, weights: np.ndarray | None = None
     ) -> tuple[np.ndarray, np.ndarray]:
         """Computes the lower and upper calibrated forecast intervals based on residuals.
 
@@ -1481,7 +1543,76 @@ class ConformalModel(GlobalForecastingModel, ABC):
         ----------
         residuals
             The residuals are expected to have shape (horizon, n components, n historical forecasts * n samples)
+        weights
+            Optional sample weights of the same shape as `residuals`, used for label shift
+            adaptation (see :func:`~darts.utils.label_shift.label_shift_weights`). `None`
+            uses the residuals exchangeable / unweighted.
         """
+
+    def _label_shift_weights(
+        self,
+        residuals: np.ndarray,
+        labels: np.ndarray,
+        cal_start: int | None,
+        cal_end: int,
+    ) -> np.ndarray | None:
+        """Density-ratio weights for one calibration window, per component.
+
+        Weights each non-conformity score by the ratio of the target value density in the
+        evaluation window over the density in the calibration window (both estimated with
+        equal-width histograms). This restores approximate interval validity under label
+        shift, where the target value distribution drifts between the calibration set and
+        the period being forecast.
+
+        Returns `None` when label shift adaptation is disabled (`label_shift_bins` is
+        falsy), in which case the calibration set is used exchangeable / unweighted.
+
+        Parameters
+        ----------
+        residuals
+            The full residual array of shape (horizon, n components, n past forecasts * n samples).
+        labels
+            The target values aligned with the last two axes of `residuals`, shape
+            (n components, n past forecasts).
+        cal_start
+            Start index of the calibration window in the last axis of `residuals` (`None`
+            stands for "from the beginning").
+        cal_end
+            End (exclusive) index of the calibration window in the last axis of `residuals`.
+        """
+        n_bins = getattr(self, "label_shift_bins", None)
+        if not n_bins:
+            return None
+
+        # the evaluation window is the most recent slice of the calibration labels,
+        # directly preceding the forecast; the older labels are the ones being weighted
+        n_eval = min(getattr(self, "label_shift_eval_length", 0), max(cal_end - 1, 0))
+        cal_end_eval = max(cal_end - n_eval, 0)
+
+        # weights outside of the calibration window are irrelevant to the caller's slice;
+        # set them to 1 so the array can be sliced together with the residuals
+        weights = np.ones_like(residuals, dtype=float)
+        for comp in range(residuals.shape[1]):
+            comp_labels = labels[comp]
+            cal_labels = comp_labels[:cal_end_eval]
+            eval_labels = (
+                comp_labels[max(cal_end_eval - n_eval, 0) : cal_end_eval]
+                if n_eval
+                else np.empty(0)
+            )
+            # forecasts without an observed label (they reach beyond the end of the
+            # series) cannot be weighted: give them the neutral weight
+            has_label = ~np.isnan(cal_labels)
+            cal_weights = np.ones(cal_labels.shape)
+            if has_label.any():
+                cal_weights[has_label] = label_shift_weights(
+                    cal_labels[has_label], eval_labels, n_bins=n_bins
+                )
+            weights[:, comp, :cal_end_eval] = np.broadcast_to(
+                cal_weights, (residuals.shape[0], cal_end_eval)
+            )
+
+        return weights
 
     @abstractmethod
     def _apply_interval(self, pred: np.ndarray, q_hat: tuple[np.ndarray, np.ndarray]):
@@ -1593,6 +1724,8 @@ class ConformalNaiveModel(ConformalModel):
         cal_length: int | None = None,
         cal_stride: int = 1,
         cal_num_samples: int = 500,
+        label_shift_bins: int | None = None,
+        label_shift_eval_length: int = 20,
         random_state: int | None = None,
     ):
         """Naive Conformal Prediction Model.
@@ -1665,6 +1798,15 @@ class ConformalNaiveModel(ConformalModel):
             model). The non-conformity scores are computed on the quantile values of these forecasts (using quantiles
             `quantiles`). Uses `1` for deterministic models. The actual conformal forecasts can have a different number
             of samples given with parameter `num_samples` in downstream tasks (e.g. predict, historical forecasts, ...).
+        label_shift_bins
+            Optionally, the number of equal-width histogram bins used to estimate the target value distribution of
+            the calibration set and of the most recent past (the evaluation window). When set, the non-conformity
+            scores are weighted by the ratio of the two densities before computing the calibrated quantiles, which
+            keeps the intervals approximately valid when the target value distribution drifts over time (label
+            shift). `None` (default) disables the adaptation and uses the scores exchangeable / unweighted.
+        label_shift_eval_length
+            The number of most recent target values used as the evaluation window for the label shift adaptation.
+            Only used if `label_shift_bins` is set.
         random_state
             Control the randomness of probabilistic conformal forecasts (sample generation) across different runs.
         """
@@ -1674,31 +1816,45 @@ class ConformalNaiveModel(ConformalModel):
             symmetric=symmetric,
             cal_length=cal_length,
             cal_num_samples=cal_num_samples,
+            label_shift_bins=label_shift_bins,
+            label_shift_eval_length=label_shift_eval_length,
             random_state=random_state,
             cal_stride=cal_stride,
         )
 
     def _calibrate_interval(
-        self, residuals: np.ndarray
+        self, residuals: np.ndarray, weights: np.ndarray | None = None
     ) -> tuple[np.ndarray, np.ndarray]:
-        def q_hat_from_residuals(residuals_):
+        def q_hat_from_residuals(residuals_, weights_=None):
             # compute quantiles of shape (forecast horizon, n components, n quantile intervals)
-            return np.quantile(
-                residuals_,
-                q=self.interval_range_sym,
-                method="higher",
-                axis=2,
-            ).transpose((1, 2, 0))
+            if weights_ is None:
+                return np.quantile(
+                    residuals_,
+                    q=self.interval_range_sym,
+                    method="higher",
+                    axis=2,
+                ).transpose((1, 2, 0))
+            # label shift adaptation: weighted quantiles of the non-conformity scores
+            return np.stack([
+                np.stack([
+                    weighted_quantile(
+                        residuals_[h, c], self.interval_range_sym, weights_[h, c]
+                    )
+                    for c in range(residuals_.shape[1])
+                ])
+                for h in range(residuals_.shape[0])
+            ])
 
         # residuals shape (horizon, n components, n past forecasts)
         if self.symmetric:
             # symmetric (from metric `ae()`)
-            q_hat = q_hat_from_residuals(residuals)
+            q_hat = q_hat_from_residuals(residuals, weights)
             return -q_hat, q_hat[:, :, ::-1]
         else:
             # asymmetric (from metric `err()`)
             q_hat = q_hat_from_residuals(
-                np.concatenate([-residuals, residuals], axis=1)
+                np.concatenate([-residuals, residuals], axis=1),
+                None if weights is None else np.concatenate([weights, weights], axis=1),
             )
             n_comps = residuals.shape[1]
             return -q_hat[:, :n_comps, :], q_hat[:, n_comps:, ::-1]
@@ -1726,6 +1882,8 @@ class ConformalQRModel(ConformalModel):
         cal_length: int | None = None,
         cal_stride: int = 1,
         cal_num_samples: int = 500,
+        label_shift_bins: int | None = None,
+        label_shift_eval_length: int = 20,
         random_state: int | None = None,
     ):
         """Conformalized Quantile Regression Model.
@@ -1802,6 +1960,15 @@ class ConformalQRModel(ConformalModel):
             model). The non-conformity scores are computed on the quantile values of these forecasts (using quantiles
             `quantiles`). Uses `1` for deterministic models. The actual conformal forecasts can have a different number
             of samples given with parameter `num_samples` in downstream tasks (e.g. predict, historical forecasts, ...).
+        label_shift_bins
+            Optionally, the number of equal-width histogram bins used to estimate the target value distribution of
+            the calibration set and of the most recent past (the evaluation window). When set, the non-conformity
+            scores are weighted by the ratio of the two densities before computing the calibrated quantiles, which
+            keeps the intervals approximately valid when the target value distribution drifts over time (label
+            shift). `None` (default) disables the adaptation and uses the scores exchangeable / unweighted.
+        label_shift_eval_length
+            The number of most recent target values used as the evaluation window for the label shift adaptation.
+            Only used if `label_shift_bins` is set.
         random_state
             Control the randomness of probabilistic conformal forecasts (sample generation) across different runs.
         """
@@ -1818,25 +1985,39 @@ class ConformalQRModel(ConformalModel):
             symmetric=symmetric,
             cal_length=cal_length,
             cal_num_samples=cal_num_samples,
+            label_shift_bins=label_shift_bins,
+            label_shift_eval_length=label_shift_eval_length,
             random_state=random_state,
             cal_stride=cal_stride,
         )
 
     def _calibrate_interval(
-        self, residuals: np.ndarray
+        self, residuals: np.ndarray, weights: np.ndarray | None = None
     ) -> tuple[np.ndarray, np.ndarray]:
         n_comps = residuals.shape[1] // (
             len(self.interval_range) * (1 + int(not self.symmetric))
         )
         n_intervals = len(self.interval_range)
 
-        def q_hat_from_residuals(residuals_):
+        def q_hat_from_residuals(residuals_, weights_=None):
             # TODO: is there a more efficient way?
             # compute quantiles with shape (horizon, n components, n quantile intervals)
             # over all past residuals
-            q_hat_tmp = np.quantile(
-                residuals_, q=self.interval_range_sym, method="higher", axis=2
-            ).transpose((1, 2, 0))
+            if weights_ is None:
+                q_hat_tmp = np.quantile(
+                    residuals_, q=self.interval_range_sym, method="higher", axis=2
+                ).transpose((1, 2, 0))
+            else:
+                # label shift adaptation: weighted quantiles of the non-conformity scores
+                q_hat_tmp = np.stack([
+                    np.stack([
+                        weighted_quantile(
+                            residuals_[h, c], self.interval_range_sym, weights_[h, c]
+                        )
+                        for c in range(residuals_.shape[1])
+                    ])
+                    for h in range(residuals_.shape[0])
+                ])
             q_hat_ = np.empty((len(residuals_), n_comps, n_intervals))
             for i in range(n_intervals):
                 for c in range(n_comps):
@@ -1846,7 +2027,7 @@ class ConformalQRModel(ConformalModel):
         if self.symmetric:
             # symmetric has one nc-score per interval (from metric `incs_qr(symmetric=True)`)
             # residuals shape (horizon, n components * n intervals, n past forecasts)
-            q_hat = q_hat_from_residuals(residuals)
+            q_hat = q_hat_from_residuals(residuals, weights)
             return -q_hat, q_hat[:, :, ::-1]
         else:
             # asymmetric has two nc-score per interval (for lower and upper quantiles, from metric
@@ -1854,8 +2035,10 @@ class ConformalQRModel(ConformalModel):
             # lower and upper residuals are concatenated along axis=1;
             # residuals shape (horizon, n components * n intervals * 2, n past forecasts)
             half_idx = residuals.shape[1] // 2
-            q_hat_lo = q_hat_from_residuals(residuals[:, :half_idx])
-            q_hat_hi = q_hat_from_residuals(residuals[:, half_idx:])
+            weights_lo = None if weights is None else weights[:, :half_idx]
+            weights_hi = None if weights is None else weights[:, half_idx:]
+            q_hat_lo = q_hat_from_residuals(residuals[:, :half_idx], weights_lo)
+            q_hat_hi = q_hat_from_residuals(residuals[:, half_idx:], weights_hi)
             return -q_hat_lo, q_hat_hi[:, :, ::-1]
 
     def _apply_interval(self, pred: np.ndarray, q_hat: tuple[np.ndarray, np.ndarray]):
